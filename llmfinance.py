@@ -516,7 +516,37 @@ def plot_prediction_distribution(predictions, portfolio_df):
 ################################################################################
 # MAIN APP FUNCTION
 ################################################################################
+@st.cache_data(ttl=3600)
+def fetch_all_etf_histories(_etf_list, start_date, end_date):
+    """
+    Fetches historical data for all ETFs concurrently using a session object for robustness.
+    """
+    etf_histories = {}
+    
+    # --- FIX IMPLEMENTATION ---
+    # Create a session object with headers, just like in process_tickers
+    session = requests.Session()
+    session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    
+    # Use a conservative number of workers
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Pass the session object to each fetch_ticker_data call
+        future_to_etf = {
+            executor.submit(fetch_ticker_data, etf, start_date, end_date, session): etf 
+            for etf in _etf_list
+        }
+        # --- END OF FIX ---
 
+        for future in as_completed(future_to_etf):
+            etf = future_to_etf[future]
+            try:
+                data = future.result()
+                if not data.empty:
+                    etf_histories[etf] = data['Close'].pct_change().dropna()
+            except Exception as e:
+                logging.error(f"Failed to fetch data for ETF {etf}: {e}")
+                
+    return etf_histories
 def main():
     st.title("🧠 AI-Enhanced Quantitative Portfolio Analysis")
     st.caption("Leveraging Deep Neural Networks for Superior Return Prediction")
