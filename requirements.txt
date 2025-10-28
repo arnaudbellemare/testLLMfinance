@@ -13,3 +13,4 @@ hmmlearn
 statsmodels
 torch
 lxml
+tqdm
