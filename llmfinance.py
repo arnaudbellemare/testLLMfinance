@@ -7,10 +7,10 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import math
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
+import requests # <-- ADDED IMPORT
 from scipy.stats import linregress
 from scipy.linalg import solve_toeplitz
 import cvxpy as cp
@@ -96,7 +96,7 @@ class AttentionLayer(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_size, 1)
         )
-        
+
     def forward(self, lstm_output):
         attention_weights = self.attention(lstm_output)
         attention_weights = F.softmax(attention_weights, dim=1)
@@ -110,14 +110,14 @@ class DeepStockPredictor(nn.Module):
     """
     def __init__(self, input_size, hidden_sizes=[256, 128, 64, 32], dropout_rate=0.3, use_attention=True):
         super(DeepStockPredictor, self).__init__()
-        
+
         self.use_attention = use_attention
         self.dropout_rate = dropout_rate
-        
+
         # Build deep architecture
         layers = []
         prev_size = input_size
-        
+
         # Add multiple hidden layers (deep architecture)
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(prev_size, hidden_size))
@@ -125,16 +125,16 @@ class DeepStockPredictor(nn.Module):
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout_rate))
             prev_size = hidden_size
-        
+
         self.feature_extractor = nn.Sequential(*layers)
-        
+
         # LSTM for temporal patterns (if sequence data available)
         self.lstm = nn.LSTM(prev_size, prev_size//2, 2, batch_first=True, dropout=dropout_rate)
-        
+
         # Attention mechanism
         if use_attention:
             self.attention = AttentionLayer(prev_size//2)
-        
+
         # Final prediction layers
         final_size = prev_size//2 if use_attention else prev_size
         self.predictor = nn.Sequential(
@@ -143,11 +143,11 @@ class DeepStockPredictor(nn.Module):
             nn.Dropout(dropout_rate/2),
             nn.Linear(16, 1)
         )
-        
+
     def forward(self, x, temporal_features=None):
         # Extract features through deep layers
         features = self.feature_extractor(x)
-        
+
         if temporal_features is not None:
             # This part is a placeholder for sequence-based models, but our current features are static per stock
             # To use LSTM, we would need to reshape features into sequences (e.g., (batch_size, seq_len, features))
@@ -167,38 +167,38 @@ class EnsemblePredictor:
         self.feature_cols = feature_cols
         self.target_col = target_col
         self.device = device
-        
+
         # Initialize models
         self.dnn = None
         self.svr = SVR(kernel='rbf', C=1.0, gamma='scale')
         self.rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        
+
         # Scalers for normalization
         self.feature_scaler = RobustScaler()
         self.target_scaler = StandardScaler()
-        
+
         # Model weights (learned through validation)
         self.weights = {'dnn': 0.5, 'svr': 0.25, 'rf': 0.25}
-        
+
     def prepare_features(self, df):
         """Prepare and scale features for model input"""
         # Select valid features
         valid_features = [col for col in self.feature_cols if col in df.columns]
         X = df[valid_features].copy()
-        
+
         # Handle potential inf/nan values from feature engineering
         X = X.replace([np.inf, -np.inf], np.nan)
         # Impute with column median
         for col in X.columns:
             if X[col].isnull().any():
                 X[col] = X[col].fillna(X[col].median())
-        
+
         return X
-    
+
     def train_dnn(self, X_train, y_train, epochs=100, batch_size=32):
         """Train the Deep Neural Network"""
         input_size = X_train.shape[1]
-        
+
         # Initialize DNN with deep architecture
         self.dnn = DeepStockPredictor(
             input_size=input_size,
@@ -206,20 +206,20 @@ class EnsemblePredictor:
             dropout_rate=0.3,
             use_attention=True # Although not fully utilized without sequence data, it's part of the architecture
         ).to(self.device)
-        
+
         # Convert to tensors
         X_tensor = torch.FloatTensor(X_train).to(self.device)
         y_tensor = torch.FloatTensor(y_train.reshape(-1, 1)).to(self.device)
-        
+
         # Create DataLoader
         dataset = TensorDataset(X_tensor, y_tensor)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        
+
         # Training setup
         optimizer = optim.AdamW(self.dnn.parameters(), lr=0.001, weight_decay=0.01)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
         criterion = nn.MSELoss()
-        
+
         # Training loop
         self.dnn.train()
         progress_bar = st.progress(0)
@@ -231,70 +231,70 @@ class EnsemblePredictor:
                 predictions = self.dnn(batch_X)
                 loss = criterion(predictions, batch_y)
                 loss.backward()
-                
+
                 # Gradient clipping to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(self.dnn.parameters(), max_norm=1.0)
-                
+
                 optimizer.step()
                 epoch_loss += loss.item()
-            
+
             avg_loss = epoch_loss / len(dataloader)
             scheduler.step(avg_loss)
-            
+
             status_text.text(f"DNN Training - Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
             progress_bar.progress((epoch + 1) / epochs)
-            
+
         status_text.text(f"DNN Training Complete. Final Loss: {avg_loss:.6f}")
-    
+
     def fit(self, df, validation_split=0.2):
         """Train all models in the ensemble"""
         # Prepare features
         X = self.prepare_features(df)
         y = df[self.target_col].values
-        
+
         # Remove NaN values from target
         valid_idx = ~np.isnan(y)
         X = X[valid_idx]
         y = y[valid_idx]
-        
+
         # Scale features and target
         X_scaled = self.feature_scaler.fit_transform(X)
         y_scaled = self.target_scaler.fit_transform(y.reshape(-1, 1)).ravel()
-        
+
         # Time series split for validation
         split_idx = int(len(X_scaled) * (1 - validation_split))
         X_train, X_val = X_scaled[:split_idx], X_scaled[split_idx:]
         y_train, y_val = y_scaled[:split_idx], y_scaled[split_idx:]
-        
+
         # Train DNN
         st.info("Training Deep Neural Network...")
         self.train_dnn(X_train, y_train)
-        
+
         # Train SVR
         st.info("Training Support Vector Regression...")
         self.svr.fit(X_train, y_train)
-        
+
         # Train Random Forest
         st.info("Training Random Forest...")
         self.rf.fit(X_train, y_train)
-        
+
         # Optimize ensemble weights using validation set
         self.optimize_weights(X_val, y_val)
-        
+
     def optimize_weights(self, X_val, y_val):
         """Optimize ensemble weights using validation data"""
         self.dnn.eval()
-        
+
         with torch.no_grad():
             # Get predictions from each model
             X_tensor = torch.FloatTensor(X_val).to(self.device)
             dnn_preds = self.dnn(X_tensor).cpu().numpy().ravel()
             svr_preds = self.svr.predict(X_val)
             rf_preds = self.rf.predict(X_val)
-        
+
         # Stack predictions
         predictions = np.column_stack([dnn_preds, svr_preds, rf_preds])
-        
+
         # Optimize weights using least squares
         try:
             weights = np.linalg.lstsq(predictions, y_val, rcond=None)[0]
@@ -305,35 +305,35 @@ class EnsemblePredictor:
                 weights = np.array([0.34, 0.33, 0.33]) # Fallback
         except:
              weights = np.array([0.34, 0.33, 0.33]) # Fallback
-        
+
         self.weights = {'dnn': weights[0], 'svr': weights[1], 'rf': weights[2]}
         st.success(f"Optimized Ensemble Weights - DNN: {weights[0]:.2%}, SVR: {weights[1]:.2%}, RF: {weights[2]:.2%}")
-    
+
     def predict(self, df):
         """Generate ensemble predictions"""
         X = self.prepare_features(df)
         X_scaled = self.feature_scaler.transform(X)
-        
+
         self.dnn.eval()
         with torch.no_grad():
             X_tensor = torch.FloatTensor(X_scaled).to(self.device)
             dnn_preds_scaled = self.dnn(X_tensor).cpu().numpy().ravel()
-        
+
         svr_preds_scaled = self.svr.predict(X_scaled)
         rf_preds_scaled = self.rf.predict(X_scaled)
-        
+
         # Inverse transform predictions to their original scale
         dnn_preds = self.target_scaler.inverse_transform(dnn_preds_scaled.reshape(-1, 1)).ravel()
         svr_preds = self.target_scaler.inverse_transform(svr_preds_scaled.reshape(-1, 1)).ravel()
         rf_preds = self.target_scaler.inverse_transform(rf_preds_scaled.reshape(-1, 1)).ravel()
-        
+
         # Apply weighted ensemble
         ensemble_preds = (
             self.weights['dnn'] * dnn_preds +
             self.weights['svr'] * svr_preds +
             self.weights['rf'] * rf_preds
         )
-        
+
         return {
             'ensemble': ensemble_preds,
             'dnn': dnn_preds,
@@ -363,11 +363,11 @@ class DNNPortfolioOptimizer:
         n_stocks = len(df)
         n_long = max(1, int(n_stocks * long_pct))
         n_short = max(1, int(n_stocks * short_pct))
-        
+
         # Get ensemble predictions
         df['DNN_Prediction'] = predictions['ensemble']
         df['Prediction_Rank'] = df['DNN_Prediction'].rank(ascending=False, method='first')
-        
+
         # Select long and short candidates
         long_candidates = df[df['Prediction_Rank'] <= n_long]
         short_candidates = df[df['Prediction_Rank'] > (n_stocks - n_short)]
@@ -393,7 +393,7 @@ class DNNPortfolioOptimizer:
         for ticker, weight in long_weights_dict.items():
             pred = long_candidates.loc[long_candidates['Ticker'] == ticker, 'DNN_Prediction'].iloc[0]
             portfolio_data.append({'Ticker': ticker, 'Weight': weight * long_scale, 'Side': 'Long', 'DNN_Prediction': pred})
-        
+
         for ticker, weight in short_weights_dict.items():
             pred = short_candidates.loc[short_candidates['Ticker'] == ticker, 'DNN_Prediction'].iloc[0]
             portfolio_data.append({'Ticker': ticker, 'Weight': -weight * short_scale, 'Side': 'Short', 'DNN_Prediction': pred})
@@ -408,13 +408,13 @@ class DNNPortfolioOptimizer:
         n = len(tickers)
         if n == 0:
             return {}
-        
+
         # Use DNN predictions as expected returns
         expected_returns = stocks_df['DNN_Prediction'].values
-        
+
         # Estimate covariance matrix from historical returns
         returns_matrix = self.historical_returns[tickers]
-        
+
         if self.risk_model == 'ledoit-wolf':
             cov_matrix = LedoitWolf().fit(returns_matrix).covariance_
         else: # sample covariance
@@ -422,21 +422,21 @@ class DNNPortfolioOptimizer:
 
         # Optimization problem
         weights = cp.Variable(n)
-        
+
         portfolio_return = expected_returns @ weights
         portfolio_risk = cp.quad_form(weights, cov_matrix)
-        
+
         # Objective: Maximize risk-adjusted return
         risk_aversion = 2.5
         objective = cp.Maximize(portfolio_return - risk_aversion * portfolio_risk)
-        
+
         # Constraints
         constraints = [
             cp.sum(weights) == 1.0,      # Sum of weights is 1 (before scaling)
             weights >= 0,                # No shorting within the long or short book
             weights <= max_position      # Max position size
         ]
-        
+
         # Solve the problem
         prob = cp.Problem(objective, constraints)
         try:
@@ -447,7 +447,7 @@ class DNNPortfolioOptimizer:
                  optimized_weights = np.ones(n) / n
         except: # Fallback
             optimized_weights = np.ones(n) / n
-        
+
         return dict(zip(tickers, optimized_weights))
 
 ################################################################################
@@ -480,10 +480,10 @@ def calculate_metrics(ticker, history, etf_histories, sector):
     """Calculates all financial metrics for a given stock."""
     if history.empty or len(history) < 252:
         return None
-    
+
     returns = history['Adj Close'].pct_change().dropna()
     metrics = {'Ticker': ticker, 'Returns': returns}
-    
+
     # Time-series metrics
     for d in [5, 10, 21, 63, 126, 252]:
         if len(returns) >= d:
@@ -518,7 +518,7 @@ def calculate_metrics(ticker, history, etf_histories, sector):
             beta, alpha, _, _, _ = linregress(sector_returns[common_idx], returns[common_idx])
             metrics['Sector_Alpha'] = alpha * 252
             metrics['Sector_Beta'] = beta
-            
+
     # Technical Indicators
     if len(history) > 14:
         delta = history['Adj Close'].diff()
@@ -526,7 +526,7 @@ def calculate_metrics(ticker, history, etf_histories, sector):
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         metrics['RSI_14d'] = 100 - (100 / (1 + rs.iloc[-1]))
-        
+
     if len(history) > 26:
         ema_26 = history['Adj Close'].ewm(span=26, adjust=False).mean()
         ema_12 = history['Adj Close'].ewm(span=12, adjust=False).mean()
@@ -549,7 +549,7 @@ def calculate_metrics(ticker, history, etf_histories, sector):
             metrics['HMM_Regime'] = hmm_model.predict(returns.tail(1).values.reshape(-1, 1))[0]
     except:
         metrics['HMM_Regime'] = np.nan
-        
+
     return metrics
 
 @st.cache_data(ttl=3600)
@@ -558,7 +558,7 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     results = []
     failed = []
     returns_dict = {}
-    
+
     with ThreadPoolExecutor(max_workers=20) as executor:
         future_to_ticker = {}
         for index, row in tickers_df.iterrows():
@@ -586,7 +586,7 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
             progress_bar.progress((i + 1) / total_futures)
 
     results_df = pd.DataFrame(results)
-    
+
     # Post-processing: Rank metrics and create a composite score
     numeric_cols = results_df.select_dtypes(include=np.number).columns.tolist()
     for col in numeric_cols:
@@ -598,7 +598,7 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     for metric, weight in default_weights.items():
         if f'{metric}_Rank' in results_df.columns:
             results_df['Score'] += results_df[f'{metric}_Rank'] * weight
-            
+
     return results_df, failed, pd.DataFrame(returns_dict)
 
 ################################################################################
@@ -613,21 +613,21 @@ def calculate_ml_portfolio_metrics(portfolio_df, historical_returns, benchmark_r
         return {}
 
     metrics = {}
-    
+
     # Calculate portfolio returns
     portfolio_returns = pd.Series(0.0, index=historical_returns.index)
-    
+
     for _, row in portfolio_df.iterrows():
         ticker = row['Ticker']
         weight = row['Weight']
         if ticker in historical_returns.columns:
             portfolio_returns += weight * historical_returns[ticker]
-    
+
     # Performance metrics
     metrics['Annual_Return'] = portfolio_returns.mean() * 252
     metrics['Volatility'] = portfolio_returns.std() * np.sqrt(252)
     metrics['Sharpe_Ratio'] = metrics['Annual_Return'] / metrics['Volatility'] if metrics['Volatility'] > 0 else 0
-    
+
     # Information Ratio (vs. benchmark)
     if benchmark_returns is not None:
         common_idx = portfolio_returns.index.intersection(benchmark_returns.index)
@@ -635,40 +635,40 @@ def calculate_ml_portfolio_metrics(portfolio_df, historical_returns, benchmark_r
         tracking_error = active_returns.std() * np.sqrt(252)
         if tracking_error > 0:
             metrics['Information_Ratio'] = (active_returns.mean() * 252) / tracking_error
-    
+
     # Drawdown
     cumulative_returns = (1 + portfolio_returns).cumprod()
     running_max = cumulative_returns.cummax()
     drawdown = (cumulative_returns - running_max) / running_max
     metrics['Max_Drawdown'] = drawdown.min()
-    
+
     # Calmar and Sortino Ratios
     if metrics['Max_Drawdown'] != 0:
         metrics['Calmar_Ratio'] = metrics['Annual_Return'] / abs(metrics['Max_Drawdown'])
-        
+
     downside_returns = portfolio_returns[portfolio_returns < 0]
     downside_vol = downside_returns.std() * np.sqrt(252)
     if downside_vol > 0:
         metrics['Sortino_Ratio'] = metrics['Annual_Return'] / downside_vol
-    
+
     return metrics, portfolio_returns
 
 def enhanced_portfolio_optimization(top_df, historical_returns, risk_aversion=2.5):
     """Performs Mean-Variance Optimization on the selected stocks."""
     tickers = top_df['Ticker'].tolist()
     returns_matrix = historical_returns[tickers]
-    
+
     mu = returns_matrix.mean() * 252
     Sigma = LedoitWolf().fit(returns_matrix).covariance_ * 252
-    
+
     weights = cp.Variable(len(tickers))
     ret = mu.values @ weights
     risk = cp.quad_form(weights, Sigma)
-    
-    prob = cp.Problem(cp.Maximize(ret - risk_aversion * risk), 
+
+    prob = cp.Problem(cp.Maximize(ret - risk_aversion * risk),
                       [cp.sum(weights) == 1, weights >= 0])
     prob.solve()
-    
+
     return pd.DataFrame({'Ticker': tickers, 'Weight': weights.value})
 
 ################################################################################
@@ -682,11 +682,11 @@ def train_ml_models(_results_df, feature_cols, target_col='Return_252d'):
     """
     # Remove rows with missing target values
     train_df = _results_df.dropna(subset=[target_col]).copy()
-    
+
     if len(train_df) < 50:
         st.warning("Insufficient data for ML training. Need at least 50 data points.")
         return None
-    
+
     ensemble = EnsemblePredictor(
         feature_cols=feature_cols,
         target_col=target_col,
@@ -700,16 +700,16 @@ def display_ml_insights(portfolio_df, predictions, metrics):
     Display ML model insights and predictions.
     """
     st.header("🤖 Deep Learning Insights")
-    
+
     col1, col2, col3 = st.columns([1,1,2])
-    
+
     with col1:
         st.subheader("Model Confidence")
         # Calculate correlation between model predictions
         corr_matrix = np.corrcoef([predictions['dnn'], predictions['svr'], predictions['rf']])
         avg_corr = (corr_matrix[0,1] + corr_matrix[0,2] + corr_matrix[1,2]) / 3
         st.metric("Model Agreement (Correlation)", f"{avg_corr:.2%}")
-        
+
         # Prediction dispersion
         pred_std = np.std([predictions['dnn'], predictions['svr'], predictions['rf']], axis=0).mean()
         st.metric("Prediction Dispersion (Std Dev)", f"{pred_std:.4f}")
@@ -730,9 +730,9 @@ def plot_prediction_distribution(predictions, portfolio_df):
     Plot the distribution of ML predictions.
     """
     fig = make_subplots(rows=1, cols=2, subplot_titles=['Ensemble Prediction Distribution', 'Long vs. Short Predictions'])
-    
+
     fig.add_trace(go.Histogram(x=predictions['ensemble'], name='Ensemble', nbinsx=50, marker_color='#636EFA'), row=1, col=1)
-    
+
     if portfolio_df is not None and not portfolio_df.empty:
         long_preds = portfolio_df[portfolio_df['Side'] == 'Long']['DNN_Prediction']
         short_preds = portfolio_df[portfolio_df['Side'] == 'Short']['DNN_Prediction']
@@ -749,45 +749,64 @@ def plot_prediction_distribution(predictions, portfolio_df):
 def main():
     st.title("🧠 AI-Enhanced Quantitative Portfolio Analysis")
     st.caption("Leveraging Deep Neural Networks for Superior Return Prediction")
-    
+
     # --- SIDEBAR CONTROLS ---
     st.sidebar.header("Universe & Timeframe")
-    
-    # Load S&P 500 tickers
-    try:
-        sp500_tickers = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-        sp500_tickers['Symbol'] = sp500_tickers['Symbol'].str.replace('.', '-', regex=False)
-        sp500_tickers = sp500_tickers[['Symbol', 'Security', 'GICS Sector']].rename(columns={'Security': 'Name', 'GICS Sector': 'Sector'})
-    except Exception as e:
-        st.error(f"Could not load S&P 500 tickers. Using a default list. Error: {e}")
-        sp500_tickers = pd.DataFrame([
-            {'Symbol': 'AAPL', 'Name': 'Apple Inc.', 'Sector': 'Technology'},
-            {'Symbol': 'MSFT', 'Name': 'Microsoft Corp.', 'Sector': 'Technology'},
-            {'Symbol': 'GOOGL', 'Name': 'Alphabet Inc.', 'Sector': 'Communication Services'},
-             # Add more defaults if needed
-        ])
+
+    # ========= CODE FIX STARTS HERE =========
+    @st.cache_data(ttl=86400) # Cache the list for a day
+    def load_sp500_tickers():
+        """Loads the S&P 500 ticker list from Wikipedia, handling 403 errors."""
+        try:
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+            # Set a user-agent header to mimic a browser
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
+            
+            # Use requests to get the page content with the header
+            response = requests.get(url, headers=headers)
+            response.raise_for_status() # Raise an exception for bad status codes
+
+            # Pass the HTML content to pandas
+            sp500_tickers = pd.read_html(response.text)[0]
+            
+            # Data cleaning
+            sp500_tickers['Symbol'] = sp500_tickers['Symbol'].str.replace('.', '-', regex=False)
+            sp500_tickers = sp500_tickers[['Symbol', 'Security', 'GICS Sector']].rename(columns={'Security': 'Name', 'GICS Sector': 'Sector'})
+            return sp500_tickers
+        except Exception as e:
+            st.error(f"Could not load S&P 500 tickers. Using a default list. Error: {e}")
+            return pd.DataFrame([
+                {'Symbol': 'AAPL', 'Name': 'Apple Inc.', 'Sector': 'Information Technology'},
+                {'Symbol': 'MSFT', 'Name': 'Microsoft Corp.', 'Sector': 'Information Technology'},
+                {'Symbol': 'GOOGL', 'Name': 'Alphabet Inc.', 'Sector': 'Communication Services'},
+                {'Symbol': 'AMZN', 'Name': 'Amazon.com Inc.', 'Sector': 'Consumer Discretionary'},
+                {'Symbol': 'JPM', 'Name': 'JPMorgan Chase & Co.', 'Sector': 'Financials'},
+            ])
+
+    sp500_tickers = load_sp500_tickers()
+    # ========= CODE FIX ENDS HERE =========
 
     selected_sectors = st.sidebar.multiselect("Filter by Sector", options=sp500_tickers['Sector'].unique(), default=sp500_tickers['Sector'].unique())
     if not selected_sectors:
         tickers_df = sp500_tickers
     else:
         tickers_df = sp500_tickers[sp500_tickers['Sector'].isin(selected_sectors)]
-    
+
     num_stocks = st.sidebar.slider("Number of Stocks to Analyze", 50, 500, 100)
     tickers_df = tickers_df.head(num_stocks)
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=st.sidebar.slider("Historical Lookback (days)", 365, 2000, 1000))
-    
+
     st.sidebar.header("🤖 ML Settings")
     use_ml = st.sidebar.checkbox("Enable Deep Learning Models", value=True, help="Use DNN ensemble for return prediction")
-    
+
     if use_ml:
         ml_weight_in_final = st.sidebar.slider("ML Signal Weight (%)", 0, 100, 70, help="Weight of ML predictions vs traditional factors for long-only portfolio")
 
     st.sidebar.header("📈 Portfolio Construction")
     is_long_short = st.sidebar.checkbox("Enable Long-Short Portfolio (ML Required)", value=True, disabled=not use_ml)
-    
+
     if is_long_short and use_ml:
         long_pct = st.sidebar.slider("Long Allocation (%)", 10, 50, 20) / 100.0
         short_pct = st.sidebar.slider("Short Allocation (%)", 10, 50, 20) / 100.0
@@ -802,12 +821,12 @@ def main():
         with st.spinner("Fetching market data and calculating factors..."):
             etf_histories = fetch_all_etf_histories(etf_list, start_date, end_date)
             results_df, failed, returns_df = process_tickers(tickers_df, etf_histories, sector_etf_map, start_date, end_date)
-        
+
         if results_df.empty:
             st.error("No data could be processed. Check your ticker list and date range.")
             st.stop()
         st.success(f"Successfully processed {len(results_df)} stocks. Failed to process {len(failed)}.")
-        
+
         # --- ML MODELING ---
         ml_portfolio = None
         ml_metrics = {}
@@ -816,9 +835,9 @@ def main():
         if use_ml:
             st.header("2. Deep Learning Model Training & Prediction")
             feature_cols = list(default_weights.keys())
-            
+
             ensemble_model = train_ml_models(results_df, feature_cols)
-            
+
             if ensemble_model:
                 with st.spinner("Generating predictions from ensemble model..."):
                     ml_predictions = ensemble_model.predict(results_df)
@@ -828,27 +847,27 @@ def main():
 
                 # Combine scores
                 ml_weight = ml_weight_in_final / 100.0
-                results_df['Combined_Score'] = (ml_weight * results_df['ML_Score'].rank(pct=True) + 
+                results_df['Combined_Score'] = (ml_weight * results_df['ML_Score'].rank(pct=True) +
                                                (1 - ml_weight) * results_df['Score'])
-                
+
                 if is_long_short:
                     optimizer = DNNPortfolioOptimizer(ensemble_model, returns_df)
                     ml_portfolio = optimizer.construct_long_short_portfolio(
-                        results_df.copy(), ml_predictions, 
+                        results_df.copy(), ml_predictions,
                         long_pct=long_pct, short_pct=short_pct, net_exposure=net_exposure)
-                    
+
                     # Calculate L/S portfolio metrics
                     ml_metrics, portfolio_returns_ts = calculate_ml_portfolio_metrics(
                         ml_portfolio, returns_df, etf_histories.get('SPY')
                     )
-                    
+
                     # Display ML insights and plots
                     display_ml_insights(ml_portfolio, ml_predictions, ml_metrics)
                     st.plotly_chart(plot_prediction_distribution(ml_predictions, ml_portfolio), use_container_width=True)
 
         # --- PORTFOLIO CONSTRUCTION ---
         st.header("3. Portfolio Allocation")
-        
+
         if weighting_method == "ML-Enhanced Long/Short":
             st.subheader("ML-Based Long-Short Portfolio")
             if ml_portfolio is not None and not ml_portfolio.empty:
@@ -869,7 +888,7 @@ def main():
             st.subheader("Long-Only Portfolio")
             score_col = 'Combined_Score' if use_ml else 'Score'
             top_15_df = results_df.nlargest(15, score_col)
-            
+
             if weighting_method == "Enhanced Portfolio Optimization (EPO)":
                 final_portfolio_df = enhanced_portfolio_optimization(top_15_df, returns_df)
             elif weighting_method == "Inverse Volatility":
@@ -883,7 +902,7 @@ def main():
                     'Ticker': top_15_df['Ticker'],
                     'Weight': 1 / 15
                 })
-            
+
             st.dataframe(final_portfolio_df.sort_values('Weight', ascending=False), use_container_width=True)
 
         # --- PERFORMANCE VISUALIZATION ---
@@ -892,7 +911,7 @@ def main():
             cumulative_returns = (1 + portfolio_returns_ts).cumprod()
             benchmark_returns = etf_histories.get('SPY')
             cumulative_benchmark = (1 + benchmark_returns[cumulative_returns.index]).cumprod()
-            
+
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=cumulative_returns.index, y=cumulative_returns, mode='lines', name='L/S Portfolio'))
             fig.add_trace(go.Scatter(x=cumulative_benchmark.index, y=cumulative_benchmark, mode='lines', name='SPY Benchmark'))
