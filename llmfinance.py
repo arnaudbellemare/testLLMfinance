@@ -7,6 +7,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import math
+import tenacity
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import requests
@@ -326,35 +327,31 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     Processes a list of tickers to fetch data and calculate metrics in parallel.
     This version is more robust to network errors and rate limiting.
     """
-    results = []
-    failed = {}
-    returns_dict = {}
+    results, failed, returns_dict = [], {}, {}
 
-    # --- FIX IMPLEMENTATION ---
-
-    # 1. Reduce Parallelism: Lowering max_workers from 10 to 5 (or even less)
-    #    is the single most effective way to avoid being blocked by Yahoo Finance.
-    MAX_WORKERS = 5
-
-    # 2. Use a Session Object: This makes our series of requests look like they
-    #    come from a single, consistent source (like a browser tab), which is less suspicious.
+    # --- START OF DEFINITIVE FIX ---
+    MAX_WORKERS = 2  # Drastically reduce concurrency to avoid IP bans
     session = requests.Session()
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {
             executor.submit(fetch_ticker_data, row['Symbol'], start_date, end_date, session): (row['Symbol'], row['Name'], row['Sector'])
-            for index, row in tickers_df.iterrows()
+            for _, row in tickers_df.iterrows()
         }
-        progress_bar = st.progress(0, text="Downloading stock data...")
-        total_futures = len(future_to_ticker)
+        progress_bar = st.progress(0, text="Downloading stock data (slowly and carefully)...")
+        total = len(future_to_ticker)
 
         for i, future in enumerate(as_completed(future_to_ticker)):
             ticker, name, sector = future_to_ticker[future]
+            
+            # Add a small random delay to be less robotic
+            time.sleep(random.uniform(0.1, 0.5))
+            
             try:
-                history = future.result()
+                history = future.result() # This will raise the RetryError if all attempts fail
                 if history.empty or len(history) < 252:
-                    failed[ticker] = "Insufficient historical data (less than 1 year)"
+                    failed[ticker] = "Insufficient historical data"
                     continue
 
                 metrics = calculate_metrics(ticker, history, _etf_histories, sector)
@@ -363,29 +360,31 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
                     results.append(metrics)
                     returns_dict[ticker] = metrics['Returns']
                 else:
-                    failed[ticker] = "Metric calculation failed (check data quality)"
-
+                    failed[ticker] = "Metric calculation failed"
+                    
+            except tenacity.RetryError as e:
+                # This is the key: get the REAL underlying error from the last attempt
+                underlying_exception = e.last_attempt.exception()
+                failed[ticker] = f"All download attempts failed. Last error: {type(underlying_exception).__name__}"
             except Exception as e:
-                # 3. Improved Error Logging: This now captures the *actual* reason for the failure
-                #    instead of a generic message.
-                logging.error(f"Error processing {ticker}: {e}")
-                failed[ticker] = f"Download failed: {str(e)}" # THIS IS THE KEY CHANGE
+                failed[ticker] = f"An unexpected error occurred: {str(e)}"
 
-            progress_bar.progress((i + 1) / total_futures, text=f"Processing {ticker}...")
-
-    # --- END OF FIX ---
+            progress_bar.progress((i + 1) / total, text=f"Processing {ticker}...")
+            
+    # --- END OF DEFINITIVE FIX ---
 
     results_df = pd.DataFrame(results)
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
 
-    numeric_cols = results_df.select_dtypes(include=np.number).columns.tolist()
-    for col in numeric_cols:
+    for col in results_df.select_dtypes(include=np.number).columns:
         results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
-    results_df['Score'] = 0
-    for metric, weight in default_weights.items():
-        if f'{metric}_Rank' in results_df.columns:
-            results_df['Score'] += results_df[f'{metric}_Rank'] * weight
+
+    results_df['Score'] = sum(
+        results_df[f'{metric}_Rank'] * weight
+        for metric, weight in default_weights.items()
+        if f'{metric}_Rank' in results_df
+    )
 
     return results_df, failed, pd.DataFrame(returns_dict)
 ################################################################################
