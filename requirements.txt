@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+yfinance
+scipy
+cvxpy
+arch
+scikit-learn
+tenacity
+pandas-datareader
+plotly
+hmmlearn
+statsmodels
+torch
+lxml
