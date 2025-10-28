@@ -13,4 +13,4 @@ hmmlearn
 statsmodels
 torch
 lxml
-tqdm
+tqdm  # <-- Make sure this line is present
