@@ -7,6 +7,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import math
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
