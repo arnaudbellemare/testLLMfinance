@@ -329,8 +329,7 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     """
     results, failed, returns_dict = [], {}, {}
 
-    # --- START OF DEFINITIVE FIX ---
-    MAX_WORKERS = 2  # Drastically reduce concurrency to avoid IP bans
+    MAX_WORKERS = 2
     session = requests.Session()
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     
@@ -345,11 +344,12 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
         for i, future in enumerate(as_completed(future_to_ticker)):
             ticker, name, sector = future_to_ticker[future]
             
-            # Add a small random delay to be less robotic
+            # --- THIS IS THE CORRECTED LINE ---
             time.sleep(random.uniform(0.1, 0.5))
+            # --- END OF CORRECTION ---
             
             try:
-                history = future.result() # This will raise the RetryError if all attempts fail
+                history = future.result()
                 if history.empty or len(history) < 252:
                     failed[ticker] = "Insufficient historical data"
                     continue
@@ -363,7 +363,6 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
                     failed[ticker] = "Metric calculation failed"
                     
             except tenacity.RetryError as e:
-                # This is the key: get the REAL underlying error from the last attempt
                 underlying_exception = e.last_attempt.exception()
                 failed[ticker] = f"All download attempts failed. Last error: {type(underlying_exception).__name__}"
             except Exception as e:
@@ -371,8 +370,6 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
 
             progress_bar.progress((i + 1) / total, text=f"Processing {ticker}...")
             
-    # --- END OF DEFINITIVE FIX ---
-
     results_df = pd.DataFrame(results)
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
