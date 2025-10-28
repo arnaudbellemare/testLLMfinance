@@ -260,27 +260,28 @@ class DNNPortfolioOptimizer:
 # SECTION 3: DATA FETCHING AND FEATURE ENGINEERING
 ################################################################################
 
-@lru_cache(maxsize=None)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def fetch_ticker_data(ticker, start_date, end_date):
-    return yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+################################################################################
+# SECTION 3: DATA FETCHING AND FEATURE ENGINEERING (REVISED AND FIXED)
+################################################################################
 
-@st.cache_data(ttl=3600)
-def fetch_all_etf_histories(_etf_list, start_date, end_date):
-    etf_histories = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_etf = {executor.submit(fetch_ticker_data, etf, start_date, end_date): etf for etf in _etf_list}
-        for future in as_completed(future_to_etf):
-            etf = future_to_etf[future]
-            try:
-                data = future.result()
-                if not data.empty:
-                    etf_histories[etf] = data['Close'].pct_change().dropna()
-            except Exception as e:
-                logging.error(f"Failed to fetch data for ETF {etf}: {e}")
-    return etf_histories
+@lru_cache(maxsize=None)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=12))
+def fetch_ticker_data(ticker, start_date, end_date, session):
+    """
+    Fetches historical data for a single ticker with retry logic and a session object.
+    The session helps manage connections and headers, making requests more robust.
+    """
+    return yf.download(
+        ticker,
+        start=start_date,
+        end=end_date,
+        progress=False,
+        auto_adjust=True,  # Automatically adjusts for splits and dividends
+        session=session      # Use the shared session object
+    )
 
 def calculate_metrics(ticker, history, etf_histories, sector):
+    """Calculates all financial metrics for a given stock. (No changes here, but included for completeness)"""
     if history.empty or len(history) < 252:
         return None
     returns = history['Close'].pct_change().dropna()
@@ -321,34 +322,63 @@ def calculate_metrics(ticker, history, etf_histories, sector):
 
 @st.cache_data(ttl=3600)
 def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
+    """
+    Processes a list of tickers to fetch data and calculate metrics in parallel.
+    This version is more robust to network errors and rate limiting.
+    """
     results = []
     failed = {}
     returns_dict = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {executor.submit(fetch_ticker_data, row['Symbol'], start_date, end_date): (row['Symbol'], row['Name'], row['Sector']) for index, row in tickers_df.iterrows()}
+
+    # --- FIX IMPLEMENTATION ---
+
+    # 1. Reduce Parallelism: Lowering max_workers from 10 to 5 (or even less)
+    #    is the single most effective way to avoid being blocked by Yahoo Finance.
+    MAX_WORKERS = 5
+
+    # 2. Use a Session Object: This makes our series of requests look like they
+    #    come from a single, consistent source (like a browser tab), which is less suspicious.
+    session = requests.Session()
+    session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_ticker = {
+            executor.submit(fetch_ticker_data, row['Symbol'], start_date, end_date, session): (row['Symbol'], row['Name'], row['Sector'])
+            for index, row in tickers_df.iterrows()
+        }
         progress_bar = st.progress(0, text="Downloading stock data...")
         total_futures = len(future_to_ticker)
+
         for i, future in enumerate(as_completed(future_to_ticker)):
             ticker, name, sector = future_to_ticker[future]
             try:
                 history = future.result()
                 if history.empty or len(history) < 252:
-                    failed[ticker] = "Insufficient historical data"
+                    failed[ticker] = "Insufficient historical data (less than 1 year)"
                     continue
+
                 metrics = calculate_metrics(ticker, history, _etf_histories, sector)
                 if metrics:
                     metrics.update({'Name': name, 'Sector': sector})
                     results.append(metrics)
                     returns_dict[ticker] = metrics['Returns']
                 else:
-                    failed[ticker] = "Metric calculation failed"
+                    failed[ticker] = "Metric calculation failed (check data quality)"
+
             except Exception as e:
+                # 3. Improved Error Logging: This now captures the *actual* reason for the failure
+                #    instead of a generic message.
                 logging.error(f"Error processing {ticker}: {e}")
-                failed[ticker] = f"Download or processing error"
+                failed[ticker] = f"Download failed: {str(e)}" # THIS IS THE KEY CHANGE
+
             progress_bar.progress((i + 1) / total_futures, text=f"Processing {ticker}...")
+
+    # --- END OF FIX ---
+
     results_df = pd.DataFrame(results)
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
+
     numeric_cols = results_df.select_dtypes(include=np.number).columns.tolist()
     for col in numeric_cols:
         results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
@@ -356,8 +386,8 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     for metric, weight in default_weights.items():
         if f'{metric}_Rank' in results_df.columns:
             results_df['Score'] += results_df[f'{metric}_Rank'] * weight
-    return results_df, failed, pd.DataFrame(returns_dict)
 
+    return results_df, failed, pd.DataFrame(returns_dict)
 ################################################################################
 # SECTION 4: PERFORMANCE ANALYSIS AND PORTFOLIO OPTIMIZATION
 ################################################################################
