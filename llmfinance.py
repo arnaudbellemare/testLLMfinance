@@ -331,8 +331,10 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     """
     results, failed, returns_dict = [], {}, {}
 
-    MAX_WORKERS = 2
+    # Using a conservative number of workers to be safe
+    MAX_WORKERS = 2 
     session = requests.Session()
+    # Setting a User-Agent header is crucial to avoid being flagged as a bot
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -346,14 +348,16 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
         for i, future in enumerate(as_completed(future_to_ticker)):
             ticker, name, sector = future_to_ticker[future]
             
-            # --- THIS IS THE CORRECTED LINE ---
+            # --- THIS IS THE FIX ---
+            # Add a small, random delay to prevent the server from rate-limiting us.
+            # This makes our script behave less like an aggressive bot.
             time.sleep(random.uniform(0.1, 0.5))
-            # --- END OF CORRECTION ---
+            # --- END OF FIX ---
             
             try:
                 history = future.result()
                 if history.empty or len(history) < 252:
-                    failed[ticker] = "Insufficient historical data"
+                    failed[ticker] = "Insufficient historical data (less than 1 year)"
                     continue
 
                 metrics = calculate_metrics(ticker, history, _etf_histories, sector)
@@ -362,9 +366,10 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
                     results.append(metrics)
                     returns_dict[ticker] = metrics['Returns']
                 else:
-                    failed[ticker] = "Metric calculation failed"
+                    failed[ticker] = "Metric calculation failed (check data quality)"
                     
             except tenacity.RetryError as e:
+                # This catches the error after all retry attempts have failed
                 underlying_exception = e.last_attempt.exception()
                 failed[ticker] = f"All download attempts failed. Last error: {type(underlying_exception).__name__}"
             except Exception as e:
@@ -376,6 +381,7 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
 
+    # Continue with ranking and scoring as before
     for col in results_df.select_dtypes(include=np.number).columns:
         results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
 
