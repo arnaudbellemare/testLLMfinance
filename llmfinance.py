@@ -71,6 +71,35 @@ default_weights = {
     'SPY_Alpha': 0.05, 'Sector_Alpha': 0.05
 }
 
+# --- NEW: List of rotating user-agents to avoid blocking (updated for 2025) ---
+user_agents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:131.0) Gecko/20100101 Firefox/131.0'
+]
+
+def get_session_with_headers():
+    """Create a new session with random user-agent and additional headers to mimic browser."""
+    session = requests.Session()
+    ua = random.choice(user_agents)
+    session.headers.update({
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0'
+    })
+    return session
+
 ################################################################################
 # SECTION 1: DEEP NEURAL NETWORK MODELS
 # (No changes in this section)
@@ -261,11 +290,11 @@ class DNNPortfolioOptimizer:
 
 ################################################################################
 # SECTION 3: DATA FETCHING AND FEATURE ENGINEERING
-# (Changes in process_tickers)
+# (Updated fetch_ticker_data and process_tickers for better anti-blocking)
 ################################################################################
 
 @lru_cache(maxsize=None)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=12))
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=10, max=30))  # Increased retries and wait times
 def fetch_ticker_data(ticker, start_date, end_date, session):
     return yf.download(
         ticker,
@@ -319,14 +348,16 @@ def calculate_metrics(ticker, history, etf_histories, sector):
 @st.cache_data(ttl=3600)
 def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
     results, failed, returns_dict = [], {}, {}
-    session = requests.Session()
-    session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     total_tickers = len(tickers_df)
     progress_bar = st.progress(0, text=f"Starting sequential download for {total_tickers} stocks...")
     for i, row in tickers_df.iterrows():
         ticker, name, sector = row['Symbol'], row['Name'], row['Sector']
         progress_text = f"({i+1}/{total_tickers}) Downloading {ticker}... Please be patient."
         progress_bar.progress((i + 1) / total_tickers, text=progress_text)
+        
+        # --- UPDATED: Create fresh session with random headers for each ticker ---
+        session = get_session_with_headers()
+        
         try:
             history = fetch_ticker_data(ticker, start_date, end_date, session)
             if history.empty:
@@ -349,9 +380,9 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
                 error_message = "All download attempts failed. Last error: YFDataException"
             failed[ticker] = error_message
         
-        # --- FIX #1: INCREASED DELAY ---
+        # --- FIX #1: INCREASED DELAY (updated to 2-5 seconds) ---
         # Increased the delay to be more cautious and avoid rate limiting.
-        time.sleep(random.uniform(1.0, 2.5))
+        time.sleep(random.uniform(2.0, 5.0))
 
     progress_bar.empty()
     results_df = pd.DataFrame(results)
@@ -455,15 +486,15 @@ def plot_prediction_distribution(predictions, portfolio_df):
 
 ################################################################################
 # MAIN APP FUNCTION
-# (Changes in this function)
+# (Updated fetch_all_etf_histories with new session handling)
 ################################################################################
 @st.cache_data(ttl=3600)
 def fetch_all_etf_histories(_etf_list, start_date, end_date):
     etf_histories = {}
-    session = requests.Session()
-    session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     st.write(f"Fetching data for {len(_etf_list)} ETFs one by one...")
     for etf in _etf_list:
+        # --- UPDATED: Fresh session for each ETF ---
+        session = get_session_with_headers()
         try:
             data = fetch_ticker_data(etf, start_date, end_date, session)
             if not data.empty:
@@ -472,7 +503,8 @@ def fetch_all_etf_histories(_etf_list, start_date, end_date):
                  logging.warning(f"No data returned for ETF {etf}")
         except Exception as e:
             logging.error(f"Failed to fetch data for ETF {etf}: {e}")
-        time.sleep(random.uniform(0.5, 1.0))
+        # Sleep between ETF fetches
+        time.sleep(random.uniform(1.0, 2.0))
     st.write("ETF data fetching complete.")
     return etf_histories
 
@@ -486,7 +518,7 @@ def main():
     def load_sp500_tickers():
         try:
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            headers = {'User-Agent': random.choice(user_agents)}  # Use random UA for wiki fetch too
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             sp500_tickers = pd.read_html(response.text)[0]
@@ -522,10 +554,10 @@ def main():
         with st.spinner("Fetching market data and calculating factors... This may take several minutes."):
             etf_histories = fetch_all_etf_histories(etf_list, start_date, end_date)
             
-            # --- FIX #2: ADDED COOL-DOWN PERIOD ---
-            # This forces the script to wait 10 seconds before starting the next batch of downloads.
-            st.write("Waiting for 10 seconds to cool down before fetching stock data...")
-            time.sleep(10)
+            # --- FIX #2: ADDED COOL-DOWN PERIOD (increased to 30 seconds) ---
+            # This forces the script to wait longer before starting the next batch of downloads.
+            st.write("Waiting for 30 seconds to cool down before fetching stock data...")
+            time.sleep(30)
             
             results_df, failed, returns_df = process_tickers(tickers_df, etf_histories, sector_etf_map, start_date, end_date)
 
