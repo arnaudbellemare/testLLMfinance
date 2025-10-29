@@ -323,65 +323,69 @@ def calculate_metrics(ticker, history, etf_histories, sector):
             metrics['Sector_Beta'] = beta
     return metrics
 
+# --- REVISED AND BULLETPROOF TICKER PROCESSOR ---
 @st.cache_data(ttl=3600)
 def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
     """
-    Processes a list of tickers to fetch data and calculate metrics in parallel.
-    This version is more robust to network errors and rate limiting.
+    Processes a list of tickers sequentially (one by one) to be extremely robust
+    against Yahoo Finance rate limiting. This will be slower but much more reliable.
     """
     results, failed, returns_dict = [], {}, {}
 
-    # Using a conservative number of workers to be safe
-    MAX_WORKERS = 2 
+    # We create one persistent session for all downloads.
     session = requests.Session()
-    # Setting a User-Agent header is crucial to avoid being flagged as a bot
+    # This header is crucial to mimic a real browser.
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_ticker = {
-            executor.submit(fetch_ticker_data, row['Symbol'], start_date, end_date, session): (row['Symbol'], row['Name'], row['Sector'])
-            for _, row in tickers_df.iterrows()
-        }
-        progress_bar = st.progress(0, text="Downloading stock data (slowly and carefully)...")
-        total = len(future_to_ticker)
+    total_tickers = len(tickers_df)
+    progress_bar = st.progress(0, text=f"Starting sequential download for {total_tickers} stocks...")
 
-        for i, future in enumerate(as_completed(future_to_ticker)):
-            ticker, name, sector = future_to_ticker[future]
+    # --- NO MORE ThreadPoolExecutor. A simple, reliable for loop. ---
+    for i, row in tickers_df.iterrows():
+        ticker, name, sector = row['Symbol'], row['Name'], row['Sector']
+        
+        progress_text = f"({i+1}/{total_tickers}) Downloading {ticker}... Please be patient."
+        progress_bar.progress((i + 1) / total_tickers, text=progress_text)
+        
+        try:
+            # We will use the tenacious retry decorator on our fetch function
+            history = fetch_ticker_data(ticker, start_date, end_date, session)
             
-            # --- THIS IS THE FIX ---
-            # Add a small, random delay to prevent the server from rate-limiting us.
-            # This makes our script behave less like an aggressive bot.
-            time.sleep(random.uniform(0.1, 0.5))
-            # --- END OF FIX ---
-            
-            try:
-                history = future.result()
-                if history.empty or len(history) < 252:
-                    failed[ticker] = "Insufficient historical data (less than 1 year)"
-                    continue
+            # After trying, check if the download actually succeeded.
+            if history.empty:
+                # yfinance returns an empty dataframe for failed downloads (e.g., 404, invalid ticker)
+                raise ValueError("Dataframe is empty (likely delisted or invalid ticker).")
 
-                metrics = calculate_metrics(ticker, history, _etf_histories, sector)
-                if metrics:
-                    metrics.update({'Name': name, 'Sector': sector})
-                    results.append(metrics)
-                    returns_dict[ticker] = metrics['Returns']
-                else:
-                    failed[ticker] = "Metric calculation failed (check data quality)"
-                    
-            except tenacity.RetryError as e:
-                # This catches the error after all retry attempts have failed
-                underlying_exception = e.last_attempt.exception()
-                failed[ticker] = f"All download attempts failed. Last error: {type(underlying_exception).__name__}"
-            except Exception as e:
+            if len(history) < 252:
+                failed[ticker] = "Insufficient historical data (less than 1 year)"
+                continue # Skip to the next ticker
+
+            metrics = calculate_metrics(ticker, history, _etf_histories, sector)
+            if metrics:
+                metrics.update({'Name': name, 'Sector': sector})
+                results.append(metrics)
+                returns_dict[ticker] = metrics['Returns']
+            else:
+                failed[ticker] = "Metric calculation failed"
+
+        except Exception as e:
+            # This catch block will now handle the final error after all retries have failed.
+            if isinstance(e, tenacity.RetryError):
+                failed[ticker] = "All download attempts failed. Last error: YFDataException"
+            else:
                 failed[ticker] = f"An unexpected error occurred: {str(e)}"
+        
+        # --- THE MOST IMPORTANT PART ---
+        # A mandatory, longer, and random delay between EACH request to appear human.
+        time.sleep(random.uniform(0.7, 1.5))
 
-            progress_bar.progress((i + 1) / total, text=f"Processing {ticker}...")
-            
+    progress_bar.empty() # Clean up the progress bar after completion
+
+    # The rest of the function remains the same
     results_df = pd.DataFrame(results)
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
 
-    # Continue with ranking and scoring as before
     for col in results_df.select_dtypes(include=np.number).columns:
         results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
 
