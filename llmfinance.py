@@ -263,28 +263,23 @@ class DNNPortfolioOptimizer:
 # SECTION 3: DATA FETCHING AND FEATURE ENGINEERING
 ################################################################################
 
-################################################################################
-# SECTION 3: DATA FETCHING AND FEATURE ENGINEERING (REVISED AND FIXED)
-################################################################################
-
 @lru_cache(maxsize=None)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=12))
 def fetch_ticker_data(ticker, start_date, end_date, session):
     """
     Fetches historical data for a single ticker with retry logic and a session object.
-    The session helps manage connections and headers, making requests more robust.
     """
     return yf.download(
         ticker,
         start=start_date,
         end=end_date,
         progress=False,
-        auto_adjust=True,  # Automatically adjusts for splits and dividends
-        session=session      # Use the shared session object
+        auto_adjust=True,
+        session=session
     )
 
 def calculate_metrics(ticker, history, etf_histories, sector):
-    """Calculates all financial metrics for a given stock. (No changes here, but included for completeness)"""
+    """Calculates all financial metrics for a given stock."""
     if history.empty or len(history) < 252:
         return None
     returns = history['Close'].pct_change().dropna()
@@ -300,7 +295,7 @@ def calculate_metrics(ticker, history, etf_histories, sector):
     risk_free_rate = 0.02
     annual_return = metrics.get('Return_252d', 0)
     annual_vol = metrics.get('Volatility_252d', 1)
-    metrics['Sharpe_252d'] = (annual_return - risk_free_rate) / annual_vol
+    metrics['Sharpe_252d'] = (annual_return - risk_free_rate) / annual_vol if annual_vol != 0 else 0
     downside_returns = returns.tail(252)[returns.tail(252) < 0]
     if not downside_returns.empty:
         downside_std = downside_returns.std() * np.sqrt(252)
@@ -323,43 +318,27 @@ def calculate_metrics(ticker, history, etf_histories, sector):
             metrics['Sector_Beta'] = beta
     return metrics
 
-# --- REVISED AND BULLETPROOF TICKER PROCESSOR ---
 @st.cache_data(ttl=3600)
 def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
     """
-    Processes a list of tickers sequentially (one by one) to be extremely robust
-    against Yahoo Finance rate limiting. This will be slower but much more reliable.
+    Processes a list of tickers sequentially to be robust against rate limiting.
     """
     results, failed, returns_dict = [], {}, {}
-
-    # We create one persistent session for all downloads.
     session = requests.Session()
-    # This header is crucial to mimic a real browser.
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    
     total_tickers = len(tickers_df)
     progress_bar = st.progress(0, text=f"Starting sequential download for {total_tickers} stocks...")
-
-    # --- NO MORE ThreadPoolExecutor. A simple, reliable for loop. ---
     for i, row in tickers_df.iterrows():
         ticker, name, sector = row['Symbol'], row['Name'], row['Sector']
-        
         progress_text = f"({i+1}/{total_tickers}) Downloading {ticker}... Please be patient."
         progress_bar.progress((i + 1) / total_tickers, text=progress_text)
-        
         try:
-            # We will use the tenacious retry decorator on our fetch function
             history = fetch_ticker_data(ticker, start_date, end_date, session)
-            
-            # After trying, check if the download actually succeeded.
             if history.empty:
-                # yfinance returns an empty dataframe for failed downloads (e.g., 404, invalid ticker)
                 raise ValueError("Dataframe is empty (likely delisted or invalid ticker).")
-
             if len(history) < 252:
                 failed[ticker] = "Insufficient historical data (less than 1 year)"
-                continue # Skip to the next ticker
-
+                continue
             metrics = calculate_metrics(ticker, history, _etf_histories, sector)
             if metrics:
                 metrics.update({'Name': name, 'Sector': sector})
@@ -367,35 +346,25 @@ def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end
                 returns_dict[ticker] = metrics['Returns']
             else:
                 failed[ticker] = "Metric calculation failed"
-
         except Exception as e:
-            # This catch block will now handle the final error after all retries have failed.
+            error_message = f"{type(e).__name__}"
             if isinstance(e, tenacity.RetryError):
-                failed[ticker] = "All download attempts failed. Last error: YFDataException"
-            else:
-                failed[ticker] = f"An unexpected error occurred: {str(e)}"
-        
-        # --- THE MOST IMPORTANT PART ---
-        # A mandatory, longer, and random delay between EACH request to appear human.
+                error_message = "All download attempts failed. Last error: YFDataException"
+            failed[ticker] = error_message
         time.sleep(random.uniform(0.7, 1.5))
-
-    progress_bar.empty() # Clean up the progress bar after completion
-
-    # The rest of the function remains the same
+    progress_bar.empty()
     results_df = pd.DataFrame(results)
     if results_df.empty:
         return results_df, failed, pd.DataFrame()
-
     for col in results_df.select_dtypes(include=np.number).columns:
         results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
-
     results_df['Score'] = sum(
         results_df[f'{metric}_Rank'] * weight
         for metric, weight in default_weights.items()
         if f'{metric}_Rank' in results_df
     )
-
     return results_df, failed, pd.DataFrame(returns_dict)
+
 ################################################################################
 # SECTION 4: PERFORMANCE ANALYSIS AND PORTFOLIO OPTIMIZATION
 ################################################################################
@@ -406,65 +375,50 @@ def calculate_ml_portfolio_metrics(portfolio_df, historical_returns, benchmark_r
     """
     if portfolio_df.empty or historical_returns.empty:
         return {}, pd.Series(dtype=float)
-
     metrics = {}
     portfolio_returns = pd.Series(0.0, index=historical_returns.index)
-
     for _, row in portfolio_df.iterrows():
         ticker = row['Ticker']
         weight = row['Weight']
         if ticker in historical_returns.columns:
             portfolio_returns += weight * historical_returns[ticker]
-
     if portfolio_returns.std() == 0: return {}, portfolio_returns
-
     metrics['Annual_Return'] = portfolio_returns.mean() * 252
     metrics['Volatility'] = portfolio_returns.std() * np.sqrt(252)
     metrics['Sharpe_Ratio'] = metrics['Annual_Return'] / metrics['Volatility'] if metrics['Volatility'] > 0 else 0
-
     if benchmark_returns is not None:
         common_idx = portfolio_returns.index.intersection(benchmark_returns.index)
         active_returns = portfolio_returns[common_idx] - benchmark_returns[common_idx]
         tracking_error = active_returns.std() * np.sqrt(252)
         if tracking_error > 0:
             metrics['Information_Ratio'] = (active_returns.mean() * 252) / tracking_error
-
     cumulative_returns = (1 + portfolio_returns).cumprod()
     running_max = cumulative_returns.cummax()
     drawdown = (cumulative_returns - running_max) / running_max
     metrics['Max_Drawdown'] = drawdown.min()
-
     if metrics['Max_Drawdown'] != 0:
         metrics['Calmar_Ratio'] = metrics['Annual_Return'] / abs(metrics['Max_Drawdown'])
-        
     downside_returns = portfolio_returns[portfolio_returns < 0]
     if not downside_returns.empty:
         downside_vol = downside_returns.std() * np.sqrt(252)
         if downside_vol > 0:
             metrics['Sortino_Ratio'] = metrics['Annual_Return'] / downside_vol
-    
     return metrics, portfolio_returns
 
 def enhanced_portfolio_optimization(top_df, historical_returns):
     """Performs Mean-Variance Optimization on the selected stocks."""
     tickers = top_df['Ticker'].tolist()
     returns_matrix = historical_returns[tickers]
-    
     mu = returns_matrix.mean() * 252
     Sigma = LedoitWolf().fit(returns_matrix).covariance_ * 252
-    
     weights = cp.Variable(len(tickers))
     ret = mu.values @ weights
     risk = cp.quad_form(weights, Sigma)
-    
-    prob = cp.Problem(cp.Maximize(ret - 2.5 * risk), 
-                      [cp.sum(weights) == 1, weights >= 0, weights <= 0.2]) # Max 20% weight per stock
+    prob = cp.Problem(cp.Maximize(ret - 2.5 * risk),
+                      [cp.sum(weights) == 1, weights >= 0, weights <= 0.2])
     prob.solve(solver=cp.ECOS)
-    
-    # Handle solver failure
     if prob.status != 'optimal':
         return pd.DataFrame({'Ticker': tickers, 'Weight': 1/len(tickers)})
-        
     return pd.DataFrame({'Ticker': tickers, 'Weight': weights.value})
 
 ################################################################################
@@ -527,34 +481,32 @@ def plot_prediction_distribution(predictions, portfolio_df):
 @st.cache_data(ttl=3600)
 def fetch_all_etf_histories(_etf_list, start_date, end_date):
     """
-    Fetches historical data for all ETFs concurrently using a session object for robustness.
+    Fetches historical data for all ETFs SEQUENTIALLY to avoid rate limiting.
     """
     etf_histories = {}
-    
-    # --- FIX IMPLEMENTATION ---
-    # Create a session object with headers, just like in process_tickers
+    # Create a persistent session with a user-agent to look like a browser
     session = requests.Session()
     session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    
-    # Use a conservative number of workers
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        # Pass the session object to each fetch_ticker_data call
-        future_to_etf = {
-            executor.submit(fetch_ticker_data, etf, start_date, end_date, session): etf 
-            for etf in _etf_list
-        }
-        # --- END OF FIX ---
 
-        for future in as_completed(future_to_etf):
-            etf = future_to_etf[future]
-            try:
-                data = future.result()
-                if not data.empty:
-                    etf_histories[etf] = data['Close'].pct_change().dropna()
-            except Exception as e:
-                logging.error(f"Failed to fetch data for ETF {etf}: {e}")
-                
+    # --- FIX: Removed ThreadPoolExecutor and replaced with a simple, sequential for loop ---
+    st.write(f"Fetching data for {len(_etf_list)} ETFs one by one...")
+    for etf in _etf_list:
+        try:
+            # Use the tenacious retry logic from the single ticker function
+            data = fetch_ticker_data(etf, start_date, end_date, session)
+            if not data.empty:
+                etf_histories[etf] = data['Close'].pct_change().dropna()
+            else:
+                 logging.warning(f"No data returned for ETF {etf}")
+        except Exception as e:
+            logging.error(f"Failed to fetch data for ETF {etf}: {e}")
+        
+        # --- CRITICAL: Add a small, random delay between each request ---
+        time.sleep(random.uniform(0.5, 1.0))
+
+    st.write("ETF data fetching complete.")
     return etf_histories
+
 def main():
     st.title("🧠 AI-Enhanced Quantitative Portfolio Analysis")
     st.caption("Leveraging Deep Neural Networks for Superior Return Prediction")
@@ -602,7 +554,7 @@ def main():
     # --- DATA PROCESSING ---
     if st.sidebar.button("Run Analysis", type="primary"):
         st.header("1. Data Collection & Feature Engineering")
-        with st.spinner("Fetching market data and calculating factors..."):
+        with st.spinner("Fetching market data and calculating factors... This may take several minutes."):
             etf_histories = fetch_all_etf_histories(etf_list, start_date, end_date)
             results_df, failed, returns_df = process_tickers(tickers_df, etf_histories, sector_etf_map, start_date, end_date)
         if results_df.empty:
