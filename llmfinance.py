@@ -293,18 +293,6 @@ class DNNPortfolioOptimizer:
 # (Updated fetch_ticker_data and process_tickers for better anti-blocking)
 ################################################################################
 
-@lru_cache(maxsize=None)
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=10, max=30))  # Increased retries and wait times
-def fetch_ticker_data(ticker, start_date, end_date, session):
-    return yf.download(
-        ticker,
-        start=start_date,
-        end=end_date,
-        progress=False,
-        auto_adjust=True,
-        session=session
-    )
-
 def calculate_metrics(ticker, history, etf_histories, sector):
     # This function is unchanged but included for completeness
     if history.empty or len(history) < 252:
@@ -344,58 +332,6 @@ def calculate_metrics(ticker, history, etf_histories, sector):
             metrics['Sector_Alpha'] = alpha * 252
             metrics['Sector_Beta'] = beta
     return metrics
-
-@st.cache_data(ttl=3600)
-def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
-    results, failed, returns_dict = [], {}, {}
-    total_tickers = len(tickers_df)
-    progress_bar = st.progress(0, text=f"Starting sequential download for {total_tickers} stocks...")
-    for i, row in tickers_df.iterrows():
-        ticker, name, sector = row['Symbol'], row['Name'], row['Sector']
-        progress_text = f"({i+1}/{total_tickers}) Downloading {ticker}... Please be patient."
-        progress_bar.progress((i + 1) / total_tickers, text=progress_text)
-        
-        # --- UPDATED: Create fresh session with random headers for each ticker ---
-        session = get_session_with_headers()
-        
-        try:
-            history = fetch_ticker_data(ticker, start_date, end_date, session)
-            if history.empty:
-                raise ValueError("Dataframe is empty (likely delisted or invalid ticker).")
-            if len(history) < 252:
-                failed[ticker] = "Insufficient historical data (less than 1 year)"
-                continue
-            metrics = calculate_metrics(ticker, history, _etf_histories, sector)
-            if metrics:
-                metrics.update({'Name': name, 'Sector': sector})
-                results.append(metrics)
-                returns_dict[ticker] = metrics['Returns']
-            else:
-                failed[ticker] = "Metric calculation failed"
-        except Exception as e:
-            # --- FIX #3: IMPROVED ERROR LOGGING ---
-            # This will give us more specific error messages if it fails again
-            error_message = f"{type(e).__name__}: {e}"
-            if isinstance(e, tenacity.RetryError):
-                error_message = "All download attempts failed. Last error: YFDataException"
-            failed[ticker] = error_message
-        
-        # --- FIX #1: INCREASED DELAY (updated to 2-5 seconds) ---
-        # Increased the delay to be more cautious and avoid rate limiting.
-        time.sleep(random.uniform(2.0, 5.0))
-
-    progress_bar.empty()
-    results_df = pd.DataFrame(results)
-    if results_df.empty:
-        return results_df, failed, pd.DataFrame()
-    for col in results_df.select_dtypes(include=np.number).columns:
-        results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
-    results_df['Score'] = sum(
-        results_df[f'{metric}_Rank'] * weight
-        for metric, weight in default_weights.items()
-        if f'{metric}_Rank' in results_df
-    )
-    return results_df, failed, pd.DataFrame(returns_dict)
 
 ################################################################################
 # SECTION 4 & 5: ANALYSIS AND VISUALIZATION
@@ -488,25 +424,116 @@ def plot_prediction_distribution(predictions, portfolio_df):
 # MAIN APP FUNCTION
 # (Updated fetch_all_etf_histories with new session handling)
 ################################################################################
+# --- UPDATED: Batch ETF fetching with threads=True ---
 @st.cache_data(ttl=3600)
 def fetch_all_etf_histories(_etf_list, start_date, end_date):
     etf_histories = {}
-    st.write(f"Fetching data for {len(_etf_list)} ETFs one by one...")
-    for etf in _etf_list:
-        # --- UPDATED: Fresh session for each ETF ---
-        session = get_session_with_headers()
+    st.write(f"Fetching data for {len(_etf_list)} ETFs in batches...")
+    
+    # Batch into groups of 10 to balance speed/rate limits
+    batch_size = 10
+    for i in range(0, len(_etf_list), batch_size):
+        batch = _etf_list[i:i+batch_size]
+        session = get_session_with_headers()  # Fresh session per batch
         try:
-            data = fetch_ticker_data(etf, start_date, end_date, session)
+            data = yf.download(
+                batch, start=start_date, end=end_date, 
+                threads=True, progress=False, auto_adjust=True, session=session
+            )
             if not data.empty:
-                etf_histories[etf] = data['Close'].pct_change().dropna()
+                for etf in batch:
+                    if etf in data.columns.get_level_values(0):  # Multi-index handling
+                        etf_histories[etf] = data[etf]['Close'].pct_change().dropna()
             else:
-                 logging.warning(f"No data returned for ETF {etf}")
+                logging.warning(f"No data for batch starting with {batch[0]}")
         except Exception as e:
-            logging.error(f"Failed to fetch data for ETF {etf}: {e}")
-        # Sleep between ETF fetches
-        time.sleep(random.uniform(1.0, 2.0))
+            logging.error(f"Batch fetch failed: {e}")
+        time.sleep(random.uniform(1.0, 2.0))  # Light delay between batches
+    
     st.write("ETF data fetching complete.")
     return etf_histories
+
+# --- UPDATED: Parallel stock processing with ThreadPoolExecutor ---
+def fetch_single_ticker(ticker, start_date, end_date, etf_histories, sector):
+    """Worker function for thread pool."""
+    session = get_session_with_headers()  # Fresh session per thread/fetch
+    try:
+        history = fetch_ticker_data(ticker, start_date, end_date, session)
+        if history.empty or len(history) < 252:
+            return ticker, None, "Insufficient data"
+        metrics = calculate_metrics(ticker, history, etf_histories, sector)
+        if metrics:
+            returns = metrics.pop('Returns')  # Extract for returns_dict
+            return ticker, metrics, None, returns
+        else:
+            return ticker, None, "Metric calculation failed", None
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        if isinstance(e, tenacity.RetryError):
+            error_msg = "All download attempts failed"
+        return ticker, None, error_msg, None
+
+@st.cache_data(ttl=3600)
+def process_tickers(tickers_df, _etf_histories, _sector_etf_map, start_date, end_date):
+    results, failed, returns_dict = [], {}, {}
+    total_tickers = len(tickers_df)
+    progress_bar = st.progress(0)
+    
+    # Use ThreadPoolExecutor for parallelism (max_workers=5 to avoid bans)
+    max_workers = 5
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_ticker = {
+            executor.submit(fetch_single_ticker, row['Symbol'], start_date, end_date, _etf_histories, row['Sector']): row['Symbol']
+            for _, row in tickers_df.iterrows()
+        }
+        
+        completed = 0
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                ticker_id, metrics, error, returns = future.result()
+                if error:
+                    failed[ticker] = error
+                elif metrics:
+                    metrics.update({'Name': tickers_df[tickers_df['Symbol'] == ticker]['Name'].iloc[0], 'Sector': tickers_df[tickers_df['Symbol'] == ticker]['Sector'].iloc[0]})
+                    results.append(metrics)
+                    if returns is not None:
+                        returns_dict[ticker] = returns
+                completed += 1
+                progress_bar.progress(completed / total_tickers, text=f"Processed {completed}/{total_tickers} stocks...")
+            except Exception as e:
+                failed[ticker] = f"Thread error: {e}"
+                completed += 1
+                progress_bar.progress(completed / total_tickers)
+            
+            # Staggered delay per completion (1-3s) to mimic human pacing
+            time.sleep(random.uniform(1.0, 3.0))
+    
+    progress_bar.empty()
+    
+    if not results:
+        return pd.DataFrame(), failed, pd.DataFrame()
+    
+    results_df = pd.DataFrame(results)
+    for col in results_df.select_dtypes(include=np.number).columns:
+        results_df[f'{col}_Rank'] = results_df[col].rank(pct=True)
+    results_df['Score'] = sum(
+        results_df[f'{metric}_Rank'] * weight
+        for metric, weight in default_weights.items()
+        if f'{metric}_Rank' in results_df
+    )
+    return results_df, failed, pd.DataFrame(returns_dict)
+
+# --- Also update the cached fetch_ticker_data to include threads=True ---
+@lru_cache(maxsize=None)
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=10, max=30))
+def fetch_ticker_data(ticker, start_date, end_date, session):
+    return yf.download(
+        ticker, start=start_date, end=end_date,
+        threads=True,  # Explicitly enable (default True, but good hygiene)
+        progress=False, auto_adjust=True, session=session
+    )
 
 def main():
     st.title("🧠 AI-Enhanced Quantitative Portfolio Analysis")
